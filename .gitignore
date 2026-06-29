@@ -1,8 +1,30 @@
-venv/
-data/
-*.pdf
-gpu_trace_PHASE2_*.csv
+# ---- Python ----
 __pycache__/
-*.pyc
-results/**/*.csv
-G_21_plots_explained.md
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---- Virtual environments ----
+venv/
+env/
+.venv/
+ebpf-env/
+
+# ---- Datasets & model weights (never commit) ----
+data/
+*.pth
+*.pt
+cifar-10-batches-py/
+
+# ---- Raw telemetry traces (regenerated per run) ----
+*.csv
+gpu_trace_*.csv
+network_trace_*.csv
+perfetto_*.json
+
+# ---- Large/binary artifacts ----
+*.pdf
+
+# ---- OS / editor cruft ----
+.DS_Store
+*.swp
