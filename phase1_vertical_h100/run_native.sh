@@ -1,141 +1,106 @@
-#!/bin/bash
-# G_21_run_native.sh
-# Group 21 - GRS Project Part A
+#!/usr/bin/env bash
 #
-# Orchestrates the full profiling pipeline in NATIVE (non-containerized) mode.
-# Starts all eBPF profilers, runs the ML workload, then stops profilers
-# and collects results.
+# Phase 1 (vertical scaling, single-node multi-GPU) -- BARE-METAL run.
+#
+# Starts the full eBPF + NVML telemetry stack on the host, runs the ResNet DDP
+# workload natively (no container), stops the probes, and exports a Perfetto
+# trace. Sweeps both architectures by default:
+#   resnet18 -> kernel-launch-bound (CPU starvation / GPU idle gaps)
+#   resnet50 -> communication-bound (PCIe / AllReduce)
 #
 # Usage:
-#   sudo ./G_21_run_native.sh [--gpus N] [--epochs E] [--duration D]
+#   sudo ./run_native.sh                         # both arches, all GPUs
+#   sudo GPUS=2 EPOCHS=5 ./run_native.sh
+#   sudo ./run_native.sh --arch resnet50 --gpus 2 --epochs 5
 #
-# Authors: Dewansh Khandelwal, Palak Mishra, Sanskar Goyal, Yash Nimkar, Kunal Verma
+set -euo pipefail
 
-set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+BPF="${REPO_ROOT}/src/bpf_kernel"
+TEL="${REPO_ROOT}/src/telemetry"
 
-# ---- Configuration ----
-GPUS="${GPUS:-1}"
+# ---- Tunables (override via env or flags) ----
+ARCHS="${ARCHS:-resnet18 resnet50}"
+GPUS="${GPUS:-2}"
 EPOCHS="${EPOCHS:-5}"
-PROFILE_DURATION="${PROFILE_DURATION:-120}"
-RESULTS_DIR="${SCRIPT_DIR}/results/native"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BATCH="${BATCH:-128}"
 MASTER_PORT="${MASTER_PORT:-29501}"
+DUR_CAP="${DUR_CAP:-3600}"          # profiler hard cap; we stop them when the workload ends
+LLC_PERIOD="${LLC_PERIOD:-10000}"
+RESULTS_BASE="${RESULTS_BASE:-${REPO_ROOT}/results/phase1}"
 
-# ---- Resolve Python and torchrun from the venv ----
-VENV_DIR="${SCRIPT_DIR}/venv"
-if [[ -f "${VENV_DIR}/bin/python3" ]]; then
-    PYTHON="${VENV_DIR}/bin/python3"
-    TORCHRUN="${VENV_DIR}/bin/torchrun"
-else
-    PYTHON="$(which python3)"
-    TORCHRUN="$(which torchrun 2>/dev/null || echo torchrun)"
-fi
+# ---- Python environments ----
+# eBPF/BCC bindings live with the system python; the workload + NVML need torch/pynvml.
+BCC_PY="${BCC_PY:-/usr/bin/python3}"
+BCC_PYTHONPATH="${BCC_PYTHONPATH:-/usr/lib/python3/dist-packages}"
+WORKLOAD_PY="${WORKLOAD_PY:-python3}"
+TORCHRUN="${TORCHRUN:-torchrun}"
 
-# ---- BCC requires system Python with PYTHONPATH (venv doesn't have bcc) ----
-BCC_PYTHON="env PYTHONPATH=/usr/lib/python3/dist-packages /usr/bin/python3"
-
-# Parse arguments
 while [[ $# -gt 0 ]]; do
-    case $1 in
-        --gpus) GPUS="$2"; shift 2 ;;
-        --epochs) EPOCHS="$2"; shift 2 ;;
-        --duration) PROFILE_DURATION="$2"; shift 2 ;;
-        *) echo "Unknown argument: $1"; exit 1 ;;
-    esac
+  case "$1" in
+    --arch) ARCHS="$2"; shift 2 ;;
+    --gpus) GPUS="$2"; shift 2 ;;
+    --epochs) EPOCHS="$2"; shift 2 ;;
+    --batch) BATCH="$2"; shift 2 ;;
+    --results) RESULTS_BASE="$2"; shift 2 ;;
+    *) echo "Unknown argument: $1"; exit 1 ;;
+  esac
 done
 
-echo "============================================================"
-echo "  NATIVE PROFILING RUN"
-echo "  GPUs: ${GPUS} | Epochs: ${EPOCHS} | Profile: ${PROFILE_DURATION}s"
-echo "============================================================"
-
-# ---- Check root ----
-if [ "$EUID" -ne 0 ]; then
-    echo "ERROR: eBPF profilers require root privileges."
-    echo "Run with: sudo ./G_21_run_native.sh"
-    exit 1
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "ERROR: eBPF profilers require root. Re-run with sudo." >&2
+  exit 1
 fi
 
-# ---- Create results directory ----
-mkdir -p "${RESULTS_DIR}"
+run_bcc() { env PYTHONPATH="${BCC_PYTHONPATH}" "${BCC_PY}" "$@"; }
+gpu_list() { seq -s, 0 $((GPUS - 1)); }
 
-# ---- Start Profilers in Background ----
-echo ""
-echo "[1/5] Starting CPU profiler..."
-${BCC_PYTHON} "${SCRIPT_DIR}/G_21_cpu_profiler.py" \
-    --duration "${PROFILE_DURATION}" \
-    --output "${RESULTS_DIR}/21_cpu_results.csv" &
-PID_CPU=$!
-echo "  PID: ${PID_CPU}"
+for ARCH in ${ARCHS}; do
+  OUT="${RESULTS_BASE}/native_${ARCH}"
+  mkdir -p "${OUT}"
+  echo "============================================================"
+  echo "  PHASE 1 NATIVE | arch=${ARCH} gpus=${GPUS} epochs=${EPOCHS}"
+  echo "  -> ${OUT}"
+  echo "============================================================"
 
-echo "[2/5] Starting syscall counter..."
-${BCC_PYTHON} "${SCRIPT_DIR}/G_21_syscall_counter.py" \
-    --duration "${PROFILE_DURATION}" \
-    --output "${RESULTS_DIR}/21_syscall_results.csv" &
-PID_SYSCALL=$!
-echo "  PID: ${PID_SYSCALL}"
+  run_bcc "${BPF}/cpu_profiler.py"          --duration "${DUR_CAP}" --output "${OUT}/cpu.csv"        & P_CPU=$!
+  run_bcc "${BPF}/syscall_counter.py"       --duration "${DUR_CAP}" --output "${OUT}/syscall.csv"    & P_SYS=$!
+  run_bcc "${BPF}/net_profiler.py"          --duration "${DUR_CAP}" --output "${OUT}/net.csv"        & P_NET=$!
+  run_bcc "${BPF}/llc_profiler.py"          --duration "${DUR_CAP}" --sample-period "${LLC_PERIOD}" --output "${OUT}/llc.csv" & P_LLC=$!
+  run_bcc "${BPF}/cuda_uprobe_monitor.py"   --duration "${DUR_CAP}" --output "${OUT}/cuda_trace.csv" & P_CUDA=$!
+  "${WORKLOAD_PY}" "${TEL}/nvml_monitor.py" --duration "${DUR_CAP}" --interval-ms 1 --gpus "$(gpu_list)" --output "${OUT}/nvml_gpu.csv" & P_NVML=$!
 
-echo "[3/5] Starting network profiler..."
-${BCC_PYTHON} "${SCRIPT_DIR}/G_21_net_profiler.py" \
-    --duration "${PROFILE_DURATION}" \
-    --output "${RESULTS_DIR}/21_net_results.csv" &
-PID_NET=$!
-echo "  PID: ${PID_NET}"
+  echo "[*] Waiting 6s for eBPF programs to compile and attach..."
+  sleep 6
 
-echo "[4/5] Starting GPU monitor..."
-${PYTHON} "${SCRIPT_DIR}/G_21_gpu_monitor_nvidia.py" \
-    --duration "${PROFILE_DURATION}" \
-    --interval 0.1 \
-    --output "${RESULTS_DIR}/21_gpu_results.csv" &
-PID_GPU=$!
-echo "  PID: ${PID_GPU}"
+  echo "[*] Launching workload..."
+  WL_START=$(date +%s%N)
+  if [[ "${GPUS}" -le 1 ]]; then
+    "${WORKLOAD_PY}" "${SCRIPT_DIR}/resnet_ddp_workload.py" \
+      --arch "${ARCH}" --gpus 1 --epochs "${EPOCHS}" --batch-size "${BATCH}" \
+      --output "${OUT}/training.json"
+  else
+    "${TORCHRUN}" --nproc_per_node="${GPUS}" --master_port="${MASTER_PORT}" \
+      "${SCRIPT_DIR}/resnet_ddp_workload.py" \
+      --arch "${ARCH}" --gpus "${GPUS}" --epochs "${EPOCHS}" --batch-size "${BATCH}" \
+      --output "${OUT}/training.json"
+  fi
+  WL_MS=$(( ($(date +%s%N) - WL_START) / 1000000 ))
+  echo "[*] Workload finished in ${WL_MS} ms. Stopping profilers..."
 
-# Give profilers time to attach
-sleep 3
+  for p in ${P_CPU} ${P_SYS} ${P_NET} ${P_LLC} ${P_CUDA} ${P_NVML}; do
+    kill -INT "${p}" 2>/dev/null || true
+  done
+  wait ${P_CPU} ${P_SYS} ${P_NET} ${P_LLC} ${P_CUDA} ${P_NVML} 2>/dev/null || true
 
-# ---- Run ML Workload ----
-echo ""
-echo "[5/5] Starting ML workload (native)..."
-echo "============================================================"
+  echo "[*] Exporting Perfetto trace..."
+  "${WORKLOAD_PY}" "${TEL}/perfetto_exporter.py" \
+    --nvml "${OUT}/nvml_gpu.csv" --cuda "${OUT}/cuda_trace.csv" --net "${OUT}/net.csv" \
+    --output "${OUT}/perfetto_trace.json" || true
 
-WORKLOAD_START=$(date +%s%N)
+  echo "[OK] arch=${ARCH} complete -> ${OUT}"
+  echo
+done
 
-if [ "${GPUS}" -eq 1 ]; then
-    ${PYTHON} "${SCRIPT_DIR}/G_21_ml_workload.py" \
-        --gpus 1 \
-        --epochs "${EPOCHS}" \
-        --output "${RESULTS_DIR}/21_training_native.json"
-else
-    ${TORCHRUN} --nproc_per_node="${GPUS}" --master_port="${MASTER_PORT}" \
-        "${SCRIPT_DIR}/G_21_ml_workload.py" \
-        --gpus "${GPUS}" \
-        --epochs "${EPOCHS}" \
-        --output "${RESULTS_DIR}/21_training_native.json"
-fi
-
-WORKLOAD_END=$(date +%s%N)
-WORKLOAD_DURATION=$(( (WORKLOAD_END - WORKLOAD_START) / 1000000 ))
-
-echo ""
-echo "============================================================"
-echo "  ML workload completed in ${WORKLOAD_DURATION}ms"
-echo "============================================================"
-
-# ---- Stop Profilers ----
-echo ""
-echo "Stopping profilers..."
-kill ${PID_CPU} ${PID_SYSCALL} ${PID_NET} ${PID_GPU} 2>/dev/null || true
-wait ${PID_CPU} ${PID_SYSCALL} ${PID_NET} ${PID_GPU} 2>/dev/null || true
-echo "All profilers stopped."
-
-# ---- Summary ----
-echo ""
-echo "============================================================"
-echo "  NATIVE RUN COMPLETE"
-echo "============================================================"
-echo ""
-echo "Results saved in: ${RESULTS_DIR}/"
-ls -la "${RESULTS_DIR}/"
-echo ""
-echo "Workload wall time: ${WORKLOAD_DURATION}ms"
-echo "============================================================"
+echo "All native Phase 1 runs complete under ${RESULTS_BASE}/"
