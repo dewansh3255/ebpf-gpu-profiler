@@ -1,0 +1,28 @@
+# ebpf-gpu-profiler -- Python dependencies
+#
+# NOTE: BCC (the eBPF toolkit) is NOT a pip package. Install it from the distro:
+#   sudo apt-get install -y bpfcc-tools python3-bpfcc libbpfcc-dev linux-headers-$(uname -r)
+# The eBPF scripts run under the system Python that has the bcc bindings, e.g.:
+#   sudo env PYTHONPATH=/usr/lib/python3/dist-packages python3 <script>.py
+
+# ---- ML workloads (Phase 1 DDP + Phase 2 FL) ----
+torch
+torchvision
+
+# ---- GPU telemetry ----
+nvidia-ml-py        # provides the `pynvml` module used by nvml_monitor.py
+
+# ---- Federated learning server/client ----
+fastapi
+uvicorn
+requests
+tqdm
+
+# ---- Analysis & visualisation ----
+numpy
+pandas
+matplotlib
+seaborn
+
+# ---- Presentation generation (optional) ----
+python-pptx

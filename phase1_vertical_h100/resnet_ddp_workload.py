@@ -160,12 +160,42 @@ def evaluate(model, testloader, criterion, device):
     }
 
 
+def build_model(arch, num_classes=10):
+    """Build a CIFAR-adapted ResNet.
+
+    arch selects the profiling regime:
+      - resnet18: shallow, cheap kernels -> the GPU drains its queue fast, so
+        the bottleneck is how quickly the CPU can launch the next kernel.
+        Exposes "Kernel-Launch-Bound" CPU starvation.
+      - resnet50: deep, bottleneck blocks + larger activations/gradients ->
+        more compute per step and far larger gradient tensors to all-reduce.
+        Exposes "Communication-Bound" PCIe/network synchronisation overhead.
+    """
+    arch = arch.lower()
+    factory = {
+        "resnet18": torchvision.models.resnet18,
+        "resnet50": torchvision.models.resnet50,
+    }
+    if arch not in factory:
+        raise ValueError(f"Unsupported --arch '{arch}'. Choose resnet18 or resnet50.")
+    model = factory[arch](num_classes=num_classes)
+    # Adapt the stem for 32x32 CIFAR images (vs 224x224 ImageNet).
+    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    model.maxpool = nn.Identity()
+    return model
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="ML Workload: ResNet-18 on CIFAR-10 - Group 21"
+        description="DDP ML workload: ResNet-18/50 on CIFAR-10 (single-node multi-GPU)"
     )
     parser.add_argument("--gpus", type=int, default=1,
                         help="Number of GPUs to use (default: 1)")
+    parser.add_argument("--arch", type=str, default="resnet18",
+                        choices=["resnet18", "resnet50"],
+                        help="Model architecture. resnet18 -> kernel-launch-bound "
+                             "(CPU starvation); resnet50 -> communication-bound "
+                             "(PCIe/AllReduce). Default: resnet18")
     parser.add_argument("--epochs", type=int, default=5,
                         help="Number of training epochs (default: 5)")
     parser.add_argument("--batch-size", type=int, default=128,
@@ -173,7 +203,7 @@ def main():
     parser.add_argument("--lr", type=float, default=0.01,
                         help="Learning rate (default: 0.01)")
     parser.add_argument("--output", type=str,
-                        default="21_training_results.json",
+                        default="training_results.json",
                         help="Output JSON file for training metrics")
     args = parser.parse_args()
 
@@ -191,7 +221,7 @@ def main():
 
     if is_main:
         print("=" * 60)
-        print("ML WORKLOAD: ResNet-18 on CIFAR-10")
+        print(f"ML WORKLOAD: {args.arch} on CIFAR-10 (DDP)")
         print("=" * 60)
         print(f"GPUs: {args.gpus}")
         print(f"Batch size per GPU: {args.batch_size}")
@@ -211,12 +241,7 @@ def main():
     )
 
     # Model
-    model = torchvision.models.resnet18(num_classes=10)
-    # Modify first conv layer for CIFAR-10 (32x32 images instead of 224x224)
-    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1,
-                            bias=False)
-    model.maxpool = nn.Identity()  # Remove maxpool for small images
-    model = model.to(device)
+    model = build_model(args.arch, num_classes=10).to(device)
 
     if distributed:
         model = DDP(model, device_ids=[local_rank])
@@ -236,7 +261,7 @@ def main():
             "batch_size": args.batch_size,
             "epochs": args.epochs,
             "lr": args.lr,
-            "model": "ResNet-18",
+            "model": args.arch,
             "dataset": "CIFAR-10",
         },
         "epochs": [],
