@@ -14,7 +14,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARCH="${ARCH:-resnet18}"
 CLIENTS="${CLIENTS:-1}"
 PORT="${PORT:-8000}"
-VENV="${VENV:-${SCRIPT_DIR}/.venv}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -25,18 +24,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Bootstrap venv if missing (torch is assumed pre-installed system-wide on this
-# node; we only add the lightweight server deps and reuse system torch).
-PY="python3"
-if [[ -x "${VENV}/bin/python3" ]]; then
-  PY="${VENV}/bin/python3"
-else
-  echo "[*] Creating venv at ${VENV} (with system site-packages for torch)..."
-  python3 -m venv --system-site-packages "${VENV}"
-  PY="${VENV}/bin/python3"
-  "${PY}" -m pip install --quiet --upgrade pip
-  "${PY}" -m pip install --quiet fastapi "uvicorn[standard]" requests tqdm
-fi
+# Server deps (torch is assumed pre-installed system-wide on this node). This
+# node may lack `python3-venv` and sudo, so we install the lightweight server
+# deps into the user site with pip --user instead of a virtualenv.
+PY="${PY:-python3}"
+echo "[*] Ensuring server deps (fastapi/uvicorn/requests/tqdm) in user site..."
+"${PY}" -m pip install --user --quiet fastapi uvicorn requests tqdm || true
 
 echo "============================================================"
 echo "  PHASE 2 FL SERVER | arch=${ARCH} clients=${CLIENTS} port=${PORT}"
