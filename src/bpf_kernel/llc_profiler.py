@@ -41,10 +41,24 @@ import sys
 import time
 
 try:
-    from bcc import BPF, PerfType, PerfHWCacheConfig
+    from bcc import BPF, PerfType
 except ImportError:
     print("ERROR: BCC is not installed. Install: sudo apt-get install python3-bpfcc")
     sys.exit(1)
+
+# PerfHWCacheConfig is not exported by all BCC versions; fall back to the
+# raw perf_event_open cache-config constants if it is missing.
+try:
+    from bcc import PerfHWCacheConfig
+    _LL = PerfHWCacheConfig.LL
+    _OP_READ = PerfHWCacheConfig.OP_READ
+    _RESULT_ACCESS = PerfHWCacheConfig.RESULT_ACCESS
+    _RESULT_MISS = PerfHWCacheConfig.RESULT_MISS
+except ImportError:
+    _LL = 2            # PERF_COUNT_HW_CACHE_LL
+    _OP_READ = 0       # PERF_COUNT_HW_CACHE_OP_READ
+    _RESULT_ACCESS = 0 # PERF_COUNT_HW_CACHE_RESULT_ACCESS
+    _RESULT_MISS = 1   # PERF_COUNT_HW_CACHE_RESULT_MISS
 
 
 BPF_PROGRAM = r"""
@@ -99,9 +113,7 @@ class LLCProfiler:
 
     def _llc_config(self, result):
         # encode PERF_TYPE_HW_CACHE config: cache | (op << 8) | (result << 16)
-        return (PerfHWCacheConfig.LL
-                | (PerfHWCacheConfig.OP_READ << 8)
-                | (result << 16))
+        return (_LL | (_OP_READ << 8) | (result << 16))
 
     def run(self):
         if os.geteuid() != 0:
@@ -111,8 +123,8 @@ class LLCProfiler:
         print("[LLC Profiler] Compiling eBPF program...")
         b = BPF(text=BPF_PROGRAM)
 
-        miss_cfg = self._llc_config(PerfHWCacheConfig.RESULT_MISS)
-        ref_cfg = self._llc_config(PerfHWCacheConfig.RESULT_ACCESS)
+        miss_cfg = self._llc_config(_RESULT_MISS)
+        ref_cfg = self._llc_config(_RESULT_ACCESS)
 
         try:
             b.attach_perf_event(
