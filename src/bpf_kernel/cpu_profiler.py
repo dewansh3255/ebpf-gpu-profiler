@@ -177,13 +177,20 @@ class SchedLatencyEvent(ct.Structure):
 class CPUProfiler:
     """eBPF-based CPU scheduling profiler."""
 
-    def __init__(self, duration, output_file, target_comm=None):
+    def __init__(self, duration, output_file, target_comm=None, max_events=500000):
         self.duration = duration
         self.output_file = output_file
         self.target_comm = target_comm
+        # Hard cap on in-memory per-event rows. sched_switch fires on EVERY
+        # context switch system-wide, so an uncapped list will exhaust RAM on a
+        # busy host over a long capture. Once capped we keep counting (the
+        # in-kernel aggregate maps stay exact) but stop storing rows.
+        self.max_events = max_events
         self.running = True
         self.ctx_switches = []
         self.sched_latencies = []
+        self.ctx_dropped = 0
+        self.lat_dropped = 0
         self.start_time = None
 
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -193,6 +200,9 @@ class CPUProfiler:
         self.running = False
 
     def _ctx_switch_callback(self, cpu, data, size):
+        if len(self.ctx_switches) >= self.max_events:
+            self.ctx_dropped += 1
+            return
         event = ct.cast(data, ct.POINTER(CtxSwitchEvent)).contents
         self.ctx_switches.append({
             "timestamp_ns": event.timestamp,
@@ -205,6 +215,9 @@ class CPUProfiler:
         })
 
     def _latency_callback(self, cpu, data, size):
+        if len(self.sched_latencies) >= self.max_events:
+            self.lat_dropped += 1
+            return
         event = ct.cast(data, ct.POINTER(SchedLatencyEvent)).contents
         self.sched_latencies.append({
             "timestamp_ns": time.time_ns(),
@@ -307,6 +320,10 @@ class CPUProfiler:
             writer.writerows(self.sched_latencies)
         print(f"[CPU Profiler] Scheduling latencies saved to: {lat_file}")
         print(f"  ({len(self.sched_latencies)} records)")
+        if self.ctx_dropped or self.lat_dropped:
+            print(f"[CPU Profiler] NOTE: capped at {self.max_events} rows/stream; "
+                  f"dropped {self.ctx_dropped} ctx-switch and {self.lat_dropped} "
+                  f"latency rows (aggregate counts above remain exact).")
 
 
 def main():
@@ -319,6 +336,9 @@ def main():
                         help="Output CSV file path")
     parser.add_argument("--filter-comm", type=str, default=None,
                         help="Filter by process command name (optional)")
+    parser.add_argument("--max-events", type=int, default=500000,
+                        help="Cap on stored per-event rows to bound memory "
+                             "(default: 500000). Aggregate counts stay exact.")
     args = parser.parse_args()
 
     if os.geteuid() != 0:
@@ -330,6 +350,7 @@ def main():
         duration=args.duration,
         output_file=args.output,
         target_comm=args.filter_comm,
+        max_events=args.max_events,
     )
     profiler.run()
 

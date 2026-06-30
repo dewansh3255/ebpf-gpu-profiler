@@ -213,9 +213,11 @@ EVENT_TYPES = {0: "tcp_send", 1: "tcp_recv", 2: "net_xmit"}
 class NetworkProfiler:
     """eBPF network stack profiler."""
 
-    def __init__(self, duration, output_file):
+    def __init__(self, duration, output_file, max_events=500000):
         self.duration = duration
         self.output_file = output_file
+        self.max_events = max_events
+        self.dropped = 0
         self.running = True
         self.events = []
 
@@ -226,6 +228,9 @@ class NetworkProfiler:
         self.running = False
 
     def _event_callback(self, cpu, data, size):
+        if len(self.events) >= self.max_events:
+            self.dropped += 1
+            return
         event = ct.cast(data, ct.POINTER(NetEvent)).contents
         self.events.append({
             "timestamp_ns": event.timestamp,
@@ -326,6 +331,9 @@ class NetworkProfiler:
 
         print(f"\n[Network Profiler] Results saved to: {self.output_file}")
         print(f"  ({len(self.events)} events)")
+        if self.dropped:
+            print(f"  NOTE: capped at {self.max_events}; dropped {self.dropped} "
+                  f"events (aggregate stats above remain exact).")
 
 
 def main():
@@ -337,6 +345,9 @@ def main():
     parser.add_argument("--output", type=str,
                         default="21_net_results.csv",
                         help="Output CSV file path")
+    parser.add_argument("--max-events", type=int, default=500000,
+                        help="Cap on stored per-event rows to bound memory "
+                             "(default: 500000). Aggregate stats stay exact.")
     args = parser.parse_args()
 
     if os.geteuid() != 0:
@@ -347,6 +358,7 @@ def main():
     profiler = NetworkProfiler(
         duration=args.duration,
         output_file=args.output,
+        max_events=args.max_events,
     )
     profiler.run()
 
