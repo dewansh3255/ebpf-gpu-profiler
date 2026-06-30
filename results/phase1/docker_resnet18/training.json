@@ -1,0 +1,63 @@
+{
+  "config": {
+    "gpus": 2,
+    "batch_size": 128,
+    "epochs": 5,
+    "lr": 0.01,
+    "model": "resnet18",
+    "dataset": "CIFAR-10"
+  },
+  "epochs": [
+    {
+      "epoch": 1,
+      "train_loss": 1.6714128845808458,
+      "train_accuracy": 37.088,
+      "epoch_time_sec": 5.917649984359741,
+      "samples_per_sec": 4224.6499989142,
+      "test_loss": 1.4521807794329487,
+      "test_accuracy": 44.96,
+      "eval_time_sec": 0.5250415802001953
+    },
+    {
+      "epoch": 2,
+      "train_loss": 1.2382673070747026,
+      "train_accuracy": 55.024,
+      "epoch_time_sec": 5.376116991043091,
+      "samples_per_sec": 4650.196422743662,
+      "test_loss": 1.2167589506016503,
+      "test_accuracy": 57.11,
+      "eval_time_sec": 0.5376391410827637
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.9984634120245369,
+      "train_accuracy": 64.056,
+      "epoch_time_sec": 5.2693047523498535,
+      "samples_per_sec": 4744.458932433395,
+      "test_loss": 1.03267304504974,
+      "test_accuracy": 63.36,
+      "eval_time_sec": 0.5425941944122314
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.8463724872895649,
+      "train_accuracy": 69.904,
+      "epoch_time_sec": 5.509939432144165,
+      "samples_per_sec": 4537.254956770255,
+      "test_loss": 0.8462205061429664,
+      "test_accuracy": 70.58,
+      "eval_time_sec": 0.5215654373168945
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.7581366814520895,
+      "train_accuracy": 73.104,
+      "epoch_time_sec": 5.535628318786621,
+      "samples_per_sec": 4516.199166615987,
+      "test_loss": 0.7589842360230941,
+      "test_accuracy": 73.14,
+      "eval_time_sec": 0.49401402473449707
+    }
+  ],
+  "total_time_sec": 30.23662829399109
+}

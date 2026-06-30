@@ -89,7 +89,7 @@ for ARCH in ${ARCHS}; do
     INNER="torchrun --nproc_per_node=${GPUS} --master_port=${MASTER_PORT} phase1_vertical_h100/resnet_ddp_workload.py --arch ${ARCH} --gpus ${GPUS} --epochs ${EPOCHS} --batch-size ${BATCH} --output results/phase1/docker_${ARCH}/training.json"
   fi
   docker run --rm --name "${CONTAINER}" \
-    --gpus all --shm-size=2g --ulimit memlock=-1 --network=bridge \
+    --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all --shm-size=2g --ulimit memlock=-1 --network=bridge \
     -v "${REPO_ROOT}/results:/workspace/results" \
     -v "${REPO_ROOT}/data:/workspace/data" \
     "${IMAGE}" bash -lc "${INNER}"

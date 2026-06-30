@@ -36,11 +36,51 @@ Docker comparison.
 
 ## Key results
 
-Phase 2 (distributed federated learning, profiled on an **RTX 3060** client
-training on the full CIFAR-10 shard, exchanging weights with a remote parameter
-server). Same workload, bare-metal vs. inside Docker (`--network=bridge`).
+### Phase 1 — Vertical scaling (2× H100 NVL DDP)
 
-### Containerisation network tax (the headline)
+ResNet DDP training on **2× NVIDIA H100 NVL** (95 GB each), 5 epochs,
+batch 128, CIFAR-10. Bare-metal vs. Docker (`--network=bridge`).
+
+#### Docker's CPU-side overhead on high-end GPUs
+
+| Metric | resnet18 native | resnet18 docker | resnet50 native | resnet50 docker |
+|---|--:|--:|--:|--:|
+| Throughput (samples/sec) | **5,271** | 4,535 | **3,112** | 3,002 |
+| Training time (5 ep, sec) | **24.2** | 27.6 | **40.4** | 41.9 |
+| Sched latency mean (µs) | **2.34** | 8.01 | **4.72** | 9.25 |
+| Sched latency P99 (µs) | **8.83** | 24.45 | **14.42** | 24.89 |
+| Syscall types (distinct) | 115 | **167** | 127 | **168** |
+| GPU utilisation (avg %) | 39.5 | 34.7 | 61.0 | 61.5 |
+| GPU power avg (W) | 152 | 146 | 245 | 239 |
+| CUDA launch queue (µs) | 7.03 | 8.33 | 5.10 | 5.79 |
+| GPU idle total (ms) | 2,307 | 2,453 | 2,328 | 1,954 |
+
+**Key findings (Phase 1):**
+- Docker adds **+14% training time** for the lighter resnet18 (27.6 s vs 24.2 s)
+  and **+3.7%** for resnet50 — the heavier model masks the overhead.
+- **Scheduler latency increases 2–3×** under Docker (mean: 2.34 → 8.01 µs for
+  r18; 4.72 → 9.25 µs for r50) — the container runtime adds run-queue delay.
+- **Syscall diversity jumps +45%** (115 → 167 distinct types) due to overlay FS
+  and namespace management, even though total syscall count is lower.
+- GPU utilisation and power are nearly identical — the H100 is powerful enough
+  that GPU-side performance is unaffected; the overhead is purely CPU/OS-side.
+- ResNet-18 has **~2× more GPU idle gaps** than resnet50 (5,510 vs 2,612),
+  confirming it remains **kernel-launch-bound** even on H100.
+
+![Phase 1 overview: bare-metal vs Docker](results/phase1/plots/phase1_overview.png)
+
+![Phase 1 GPU idle-gap CDF](results/phase1/plots/phase1_gpu_idle_cdf.png)
+
+Full machine-readable numbers: [`results/phase1/plots/phase1_summary.json`](results/phase1/plots/phase1_summary.json).
+
+---
+
+### Phase 2 — Horizontal scaling (RTX 3060 federated learning)
+
+Distributed FL on an **RTX 3060** client training on the full CIFAR-10 shard,
+exchanging weights with a remote parameter server. Bare-metal vs. Docker.
+
+#### Containerisation network tax (the headline)
 Docker's bridge/NAT + veth path inflates the TCP latency tail by **1–2 orders
 of magnitude** and roughly **doubles–triples** the number of network events for
 an identical workload:
@@ -57,7 +97,7 @@ Docker also **lowers average GPU utilisation** (cycles and time lost to the
 container networking/runtime path) and **raises the LLC miss rate** — clearest
 for the light resnet18, where namespace overhead is a larger fraction of the work.
 
-### Dual-model regimes (bare metal)
+#### Dual-model regimes (bare metal)
 The two architectures were chosen to stress different bottlenecks, and the
 probes confirm the split:
 
@@ -71,15 +111,14 @@ probes confirm the split:
 So **ResNet-18 = kernel-launch-bound CPU starvation**, **ResNet-50 =
 communication-bound** — exactly the two regimes the suite set out to isolate.
 
-### Figures
+#### Figures
 ![Phase 2 overview: bare-metal vs Docker](results/phase2/plots/phase2_overview.png)
 
 ![GPU idle-gap CDF](results/phase2/plots/phase2_gpu_idle_cdf.png)
 
 Full machine-readable numbers: [`results/phase2/plots/phase2_summary.json`](results/phase2/plots/phase2_summary.json).
 Every run also emits a merged **Perfetto** trace (`perfetto_trace.json`) viewable
-at [ui.perfetto.dev](https://ui.perfetto.dev) (kept local — see
-[Project status](#project-status)).
+at [ui.perfetto.dev](https://ui.perfetto.dev).
 
 ---
 
@@ -288,13 +327,13 @@ python3 analysis_and_plots/gpu_idle_gaps.py \
 | 1. Repo restructuring | ✅ done |
 | 2. Code & telemetry upgrades | ✅ done (pynvml monitor, launch/sync probe, LLC PMU, dual-model, FL full-shard, Perfetto export) |
 | 3a. **Phase 2** (RTX 3060 ⇄ FL server) | ✅ **complete** — native + Docker, resnet18 + resnet50, full telemetry + plots |
-| 3b. **Phase 1** (2× H100 DDP) | ⏳ pending — H100 node shared with other users; runs once GPUs are free |
-| 4. Analysis & docs | ✅ Phase 2 done; Phase 1 plots to follow its run |
+| 3b. **Phase 1** (2× H100 DDP) | ✅ **complete** — native + Docker, resnet18 + resnet50, full eBPF + NVML + Perfetto |
+| 4. Analysis & docs | ✅ **complete** — both phases plotted, README updated with results tables |
 
 Raw per-run CSVs and the (large) `perfetto_trace.json` files are kept **local
 only** — they exceed GitHub's file-size limit and are reproducible from the run
-scripts. The committed `results/phase2/plots/` (PNGs + `phase2_summary.json`)
-capture the findings.
+scripts. The committed `results/phase1/plots/` and `results/phase2/plots/`
+(PNGs + summary JSONs) capture the findings.
 
 ---
 
