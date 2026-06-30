@@ -59,7 +59,7 @@ if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
   exit 1
 fi
 
-run_bcc() { env PYTHONPATH="${BCC_PYTHONPATH}" "${BCC_PY}" "$@"; }
+run_bcc() { exec env PYTHONPATH="${BCC_PYTHONPATH}" "${BCC_PY}" "$@"; }
 gpu_list() { seq -s, 0 $((GPUS - 1)); }
 
 for ARCH in ${ARCHS}; do

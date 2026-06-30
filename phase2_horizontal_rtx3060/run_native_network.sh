@@ -51,7 +51,7 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
-run_bcc() { env PYTHONPATH="${BCC_PYTHONPATH}" "${BCC_PY}" "$@"; }
+run_bcc() { exec env PYTHONPATH="${BCC_PYTHONPATH}" "${BCC_PY}" "$@"; }
 
 echo "Server: ${SERVER_URL}  (make sure run_server.sh is already running there)"
 

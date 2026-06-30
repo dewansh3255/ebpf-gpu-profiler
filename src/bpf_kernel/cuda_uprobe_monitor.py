@@ -185,10 +185,15 @@ MEM_SYMS = [
 
 
 class CudaUprobeMonitor:
-    def __init__(self, duration, output_file, libcuda="cuda"):
+    def __init__(self, duration, output_file, libcuda="cuda", max_events=1000000):
         self.duration = duration
         self.output_file = output_file
         self.libcuda = libcuda
+        # Kernel launches fire thousands/sec during training; cap stored rows so
+        # a long capture can't exhaust RAM. Summary percentiles below use only
+        # the retained sample.
+        self.max_events = max_events
+        self.dropped = 0
         self.events = []
         self.running = True
         signal.signal(signal.SIGINT, self._stop)
@@ -213,6 +218,9 @@ class CudaUprobeMonitor:
         return hooked
 
     def _callback(self, cpu, data, size):
+        if len(self.events) >= self.max_events:
+            self.dropped += 1
+            return
         e = ct.cast(data, ct.POINTER(GpuEvent)).contents
         self.events.append({
             "ts_mono_ns": e.ts_ns,
@@ -269,6 +277,9 @@ class CudaUprobeMonitor:
             writer.writeheader()
             writer.writerows(self.events)
         print(f"[CUDA Monitor] Saved -> {self.output_file}")
+        if self.dropped:
+            print(f"[CUDA Monitor] NOTE: capped at {self.max_events} events; "
+                  f"dropped {self.dropped} (summary uses the retained sample).")
 
     def _print_summary(self):
         if not self.events:
@@ -299,9 +310,12 @@ def main():
     parser.add_argument("--output", type=str, default="results/cuda_trace.csv")
     parser.add_argument("--libcuda", type=str, default="cuda",
                         help="library name/path for libcuda (default: 'cuda')")
+    parser.add_argument("--max-events", type=int, default=1000000,
+                        help="Cap on stored events to bound memory (default: 1M)")
     args = parser.parse_args()
 
-    CudaUprobeMonitor(args.duration, args.output, args.libcuda).run()
+    CudaUprobeMonitor(args.duration, args.output, args.libcuda,
+                      max_events=args.max_events).run()
 
 
 if __name__ == "__main__":
