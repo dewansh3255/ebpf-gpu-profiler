@@ -1,290 +1,159 @@
-# Group 21 — GRS Project Part B (Final Submission)
-# eBPF + eGPU: Profiling CPU, Network, GPU Overheads in Containerized vs Native ML Workloads
+# ebpf-gpu-profiler
 
-## Project Overview
+A bare-metal vs. container benchmarking suite that quantifies the OS-level
+overhead Docker imposes on GPU machine-learning workloads, using **eBPF**
+kernel instrumentation correlated with **NVML** GPU telemetry.
 
-This project profiles the performance overhead introduced by containerization (Docker) on ML training workloads running on multi-GPU servers. We use:
+Most "Docker has near-zero overhead" claims look only at wall-clock throughput.
+This suite goes a layer deeper: it attaches eBPF probes to the scheduler, the
+syscall layer, the network stack, the CPU PMU, and the CUDA user-space driver,
+then lines that up with millisecond-resolution GPU counters. That exposes costs
+that wall-clock timing hides — kernel-launch-bound GPU starvation, container
+network-path latency, and namespace-induced cache pollution.
 
-- **eBPF** for CPU scheduling, syscall, and TCP network profiling (kernel-level, zero-overhead tracing)
-- **eGPU-inspired GPU tracing** via eBPF uprobes on `libcuda.so` for GPU kernel launch and memory transfer monitoring
-- **nvidia-smi polling** for GPU utilization, power, and temperature monitoring
+---
 
-> **Note on eGPU**: The real eGPU framework (Yang et al., HCDS '25) JIT-compiles eBPF bytecode into NVIDIA PTX and injects probes directly into GPU kernels. Building the full eGPU framework requires LLVM ≥15, custom bpftime userspace runtime, and Frida-based binary rewriting — which could not be compiled in our environment (host LLVM 14, Docker image LLVM 10). We adopt a **hybrid approach**: using standard eBPF uprobes on the CUDA driver API (`libcuda.so`) to trace GPU operations from the CPU side, combined with nvidia-smi polling. This captures the same API-level events (kernel launches, memory transfers) without PTX-level instrumentation.
+## Two-phase architecture
 
-### What We Measure
+The suite is organized around two complementary scaling axes:
 
-| Profiling Layer | Tool | Technique |
+### Phase 1 — Vertical scaling (single node, multi-GPU)
+`phase1_vertical_h100/` — a ResNet DDP workload on a single multi-GPU node
+(developed for 2× H100). Profiles intra-node behaviour: NCCL all-reduce,
+inter-GPU PCIe traffic, and per-step kernel-launch overhead, bare-metal vs.
+inside a container.
+
+### Phase 2 — Horizontal scaling (distributed federated learning)
+`phase2_horizontal_rtx3060/` — a federated-learning setup where a profiled
+RTX 3060 client trains on its full CIFAR-10 shard and exchanges weights with a
+remote parameter server. Profiles the **communication-bound** regime: the TCP
+path, scheduler latency, and syscall overhead of the container network stack
+vs. the host.
+
+### Dual-model design
+Both phases accept `--arch resnet18 | resnet50`:
+- **ResNet-18** — light kernels; the GPU drains its queue fast, so the limiter
+  is how quickly the CPU issues the next kernel. Exposes **kernel-launch-bound
+  CPU starvation** (GPU idle gaps).
+- **ResNet-50** — deep, bottleneck-heavy; large activations and ~98 MB gradient
+  tensors per update. Exposes **communication-bound** PCIe / network
+  synchronisation overhead.
+
+---
+
+## What gets measured
+
+| Layer | Tool | Signal |
 |---|---|---|
-| CPU Scheduling | `G_21_cpu_profiler.py` | eBPF tracepoints (`sched:sched_switch`) |
-| System Calls | `G_21_syscall_counter.py` | eBPF tracepoints (`raw_syscalls:sys_enter/sys_exit`) |
-| Network Stack | `G_21_net_profiler.py` | eBPF kprobes (`tcp_sendmsg`, `tcp_recvmsg`) |
-| GPU Utilization | `G_21_gpu_monitor_nvidia.py` | nvidia-smi polling (util, mem, power, temp) |
-| GPU Kernel Tracing | `G_21_egpu_monitor.py` | eBPF uprobes on `libcuda.so` (`cuLaunchKernel`, `cuMemcpy*`) — hybrid approach |
-| Network (FL) | `Sanskar-Kunal/G_21_egpu_net_monitor.py` | eBPF kprobes + tracepoints (TCP + scheduler) |
+| Scheduler | `src/bpf_kernel/cpu_profiler.py` | context switches, run-queue latency |
+| Syscalls | `src/bpf_kernel/syscall_counter.py` | per-syscall count + latency |
+| Network | `src/bpf_kernel/net_profiler.py` | TCP send/recv bytes + latency |
+| LLC cache | `src/bpf_kernel/llc_profiler.py` | last-level-cache misses via CPU PMU; per-cgroup attribution |
+| CUDA driver | `src/bpf_kernel/cuda_uprobe_monitor.py` | `cuLaunchKernel` queue overhead **vs.** `cuStreamSynchronize` hardware-exec+sync time |
+| GPU device | `src/telemetry/nvml_monitor.py` | utilisation, memory, **PCIe TX/RX**, power (NVML, ~1 ms loop) |
+| Unified view | `src/telemetry/perfetto_exporter.py` | merges everything into a Chrome Trace Event JSON for [ui.perfetto.dev](https://ui.perfetto.dev) |
 
-### Experiment Setup
+### The "true execution probe"
+`cuda_uprobe_monitor.py` separates two costs a launch-only trace conflates:
+`cuLaunchKernel` only *enqueues* work (CPU-side driver overhead), while
+`cuStreamSynchronize` *blocks* until the device finishes (real hardware
+execution + sync). The analysis layer then derives **GPU idle gaps** — the time
+between a sync returning and the next kernel launch — which is the direct
+measure of CPU-side GPU starvation.
 
-- **Hardware**: 2x NVIDIA H100 NVL (95830 MiB each), AMD EPYC 9354 32-Core, 503.6 GB RAM
-- **Software**: Ubuntu 22.04, Kernel 5.15.0-161-generic, CUDA 12.1.1, PyTorch 2.5.1+cu121, Docker 29.3.1
-- **Workload**: ResNet-18 on CIFAR-10, 10 epochs, batch_size=128, PyTorch DDP across 2 GPUs
-- **Methodology**: Single trial run for each mode (native and container); results are from that run
+---
 
-## Team — Group 21
-
-- Dewansh Khandelwal
-- Palak Mishra
-- Sanskar Goyal
-- Yash Nimkar
-- Kunal Verma
-
-## Project Structure
+## Repository layout
 
 ```
-G_21_Part_B_eBPF_eGPU/
-│
-├── README.md                           # This file
-├── Dockerfile                          # CUDA 12.1 + PyTorch + BCC container image
-│
-│── eBPF Profilers (CPU/Syscall/Network) ────────────────
-├── G_21_cpu_profiler.py                # eBPF CPU scheduler profiler (ctx switches + sched latency)
-├── G_21_syscall_counter.py             # eBPF syscall counter with per-call latency
-├── G_21_net_profiler.py                # eBPF TCP send/recv network profiler
-│
-│── eGPU-Inspired GPU Profiler (eBPF uprobes) ───────────
-├── G_21_egpu_monitor.py                        # eBPF uprobes on libcuda.so — hybrid approach
-├── Sanskar-Kunal/G_21_egpu_net_monitor.py     # eBPF network + scheduler monitor (FL scenario)
-│
-│── Data & Results ──────────────────────────────────────
-├── G_21_gpu_monitor_nvidia.py                  # nvidia-smi based GPU polling (util, mem, power, temp)
-│
-│── ML Workload ─────────────────────────────────────────
-├── G_21_ml_workload.py                 # PyTorch DDP ResNet-18 on CIFAR-10 (multi-GPU)
-│
-│── Federated Learning (Partner — Sanskar-Kunal/) ──────
-├── Sanskar-Kunal/G_21_federated_server.py    # FastAPI federated learning server (FedAvg)
-├── Sanskar-Kunal/G_21_federated_client.py    # FL client (ResNet-18, gradient upload)
-├── Sanskar-Kunal/G_21_federated_dataset.py   # CIFAR-10 data partitioning for FL
-├── Sanskar-Kunal/G_21_federated_main.py      # Local FL simulation (2 clients, 3 rounds)
-│
-│── Orchestration Scripts ───────────────────────────────
-├── G_21_run_experiment.sh                      # Master experiment runner
-├── G_21_run_native.sh                          # Native profiling orchestrator
-├── G_21_run_container.sh                       # Container profiling orchestrator
-├── G_21_container_setup.sh                     # Docker image builder & container manager
-├── Sanskar-Kunal/G_21_local_dry_run.sh        # FL dry run with eBPF monitoring
-│
-│── Analysis & Visualization ────────────────────────────
-├── G_21_compare_results.py                     # Generate 11 comparison plots + JSON summaries
-├── G_21_analyze_cpu.py                         # CPU CSV analyzer with comparison mode
-├── G_21_plot_results.py                        # Per-scenario plotting
-├── G_21_plot_hardcoded.py                      # Hardcoded matplotlib plots (no CSV input)
-├── Sanskar-Kunal/G_21_unified_timeline.py     # 3-row dashboard (GPU + CPU + Network)
-│
-│── eGPU-Inspired GPU Profiler (eBPF uprobes) ───────────
-├── G_21_egpu_monitor.py                        # eBPF uprobes on libcuda.so — hybrid approach
-├── Sanskar-Kunal/G_21_egpu_net_monitor.py     # eBPF network + scheduler monitor (FL scenario)
-├── data/cifar-10-batches-py/           # CIFAR-10 dataset
-└── results/
-    ├── native/                         # Native run CSVs + training JSON
-    ├── container/                      # Container run CSVs + training JSON + inspect JSON
-    ├── plots_hardcoded/                # 11 hardcoded PNGs (from G_21_plot_hardcoded.py)
-    └── system_info.json                # System specs
+ebpf-gpu-profiler/
+├── src/
+│   ├── bpf_kernel/        # eBPF/BCC profilers (cpu, net, syscall, llc, cuda uprobe)
+│   └── telemetry/         # NVML monitor + Perfetto exporter
+├── phase1_vertical_h100/  # ResNet DDP workload + run_native.sh / run_docker.sh
+├── phase2_horizontal_rtx3060/
+│   ├── fl_server.py fl_client.py fl_dataset.py fl_model.py fl_main.py
+│   ├── run_server.sh              # FL parameter server (unprofiled peer)
+│   ├── run_native_network.sh      # profiled bare-metal client
+│   └── run_docker_network.sh      # profiled containerized client
+├── analysis_and_plots/    # gpu_idle_gaps.py, phase2_compare.py, plotting/aggregation
+├── setup/                 # provision_profiled_node.sh, verify_node.sh
+├── Dockerfile             # containerized workload image
+└── requirements.txt
 ```
 
-## Key Results
+---
 
-| Metric | Native | Container | Overhead |
-|---|---|---|---|
-| Training Time (sec) | 31.8 | 34.3 | **+7.9%** |
-| Throughput (samples/sec) | 9,274 | 8,472 | **-8.6%** |
-| Final Test Accuracy (%) | 81.1 | 81.1 | +0.0% |
-| GPU 0 Avg Util (active, %) | 76.7 | 74.1 | -3.4% |
-| GPU 0 Avg Power (W) | 158.4 | 198.9 | **+25.6%** |
-| Sched Latency Mean (μs) | 13.9 | 17.7 | +27.3% |
-| Sched Latency P95 (μs) | 15.2 | 14.4 | -5.3% |
-| Total Syscalls | 11,926,534 | 8,180,511 | -31.4%† |
-| Unique Syscall Types | 121 | 167 | **+38.0%** |
-| TCP Send Avg Latency (μs) | 30.4 | 35.7 | +17.4% |
+## Setup
 
-† Different profiling windows (native 61.1s vs container 43.6s); syscall rate is comparable.
+eBPF profilers need root and run under the system Python that carries the BCC
+bindings; the workload + NVML need PyTorch (CUDA 12.1) and `nvidia-ml-py`.
 
-**Key Findings:**
-- Container adds **~7.9% training time overhead** and **-8.6% throughput** on H100 NVL GPUs
-- GPU utilization during active training is near-identical (76.7% vs 74.1%) — GPU remains the bottleneck
-- GPU power consumption is **+25.6% higher** in container, likely due to Docker namespace initialization
-- Syscall diversity increases significantly (**+38% unique types**) due to container overlay FS and namespace management
-- CPU scheduling latency mean is slightly higher in container (+27.3%) but P95/P99 are comparable
-- Both configurations achieve identical final test accuracy (81.1%), confirming correctness
-
-## Prerequisites
-
-### System Requirements
-- Linux (Ubuntu 20.04+ or 22.04)
-- NVIDIA GPU(s) with CUDA 12.1+ drivers
-- Docker with NVIDIA Container Toolkit
-- Python 3.8+
-- Root/sudo access (required for eBPF profilers)
-- BCC (BPF Compiler Collection) tools
-
-### Installation
+Provision a profiled GPU node (Ubuntu 22.04) in one shot:
 
 ```bash
-# 1. Install BCC (eBPF tooling)
-sudo apt-get update
-sudo apt-get install -y bpfcc-tools python3-bpfcc libbpfcc-dev linux-headers-$(uname -r)
-
-# 2. Install Python dependencies
-pip3 install torch torchvision matplotlib numpy psutil pandas seaborn fastapi uvicorn requests
-
-# 3. Install Docker + NVIDIA Container Toolkit
-curl -fsSL https://get.docker.com -o get-docker.sh && sudo sh get-docker.sh
-# Then follow: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+sudo bash setup/provision_profiled_node.sh   # driver, BCC, torch, docker, toolkit
+# reboot to load the NVIDIA kernel module, then:
+bash setup/verify_node.sh
 ```
 
-## Usage
+The FL parameter-server peer only needs PyTorch (no root): `run_server.sh`
+installs its light deps into the user site automatically.
 
-### Run Full Experiment
+> BCC is **not** a pip package — it is installed from the distro
+> (`bpfcc-tools python3-bpfcc`). The eBPF scripts run as:
+> `sudo env PYTHONPATH=/usr/lib/python3/dist-packages python3 <script>.py`
+
+---
+
+## Running
+
+### Phase 1 (single-node multi-GPU)
+```bash
+# bare metal (sweeps resnet18 + resnet50, all GPUs)
+sudo ./phase1_vertical_h100/run_native.sh
+# docker (build the image first)
+docker build -t ebpf-gpu-profiler:latest .
+sudo ./phase1_vertical_h100/run_docker.sh
+```
+
+### Phase 2 (distributed FL)
+```bash
+# on the server peer:
+ARCH=resnet18 CLIENTS=1 ./phase2_horizontal_rtx3060/run_server.sh
+# on the profiled RTX 3060 client (bare metal, then docker):
+sudo SERVER_URL=http://<server-ip>:8100 ./phase2_horizontal_rtx3060/run_native_network.sh
+sudo SERVER_URL=http://<server-ip>:8100 ./phase2_horizontal_rtx3060/run_docker_network.sh
+```
+
+Each run writes to `results/<phase>/<mode>_<arch>/`: the eBPF CSVs, `nvml_gpu.csv`,
+and a merged `perfetto_trace.json`. Profilers are memory-bounded (`--max-events`)
+and stop cleanly when the workload finishes.
+
+---
+
+## Analysis
 
 ```bash
-sudo ./G_21_run_native.sh --gpus 2 --epochs 10 --duration 180
-sudo ./G_21_run_container.sh --gpus 2 --epochs 10 --duration 180
+# GPU idle gaps (CPU starvation), native vs docker
+python3 analysis_and_plots/gpu_idle_gaps.py \
+    --cuda results/phase2/native_resnet18/cuda_trace.csv \
+    --cuda2 results/phase2/docker_resnet18/cuda_trace.csv \
+    --label1 Native --label2 Docker --plot results/phase2/plots/idle.png
+
+# full bare-metal vs docker comparison (both arches)
+python3 analysis_and_plots/phase2_compare.py \
+    --results-base results/phase2 --archs resnet18 resnet50 \
+    --out results/phase2/plots
+
+# view a unified timeline
+#   open results/phase2/<run>/perfetto_trace.json at https://ui.perfetto.dev
 ```
 
-### Run Individual Components
+---
 
-```bash
-# Native profiling only
-sudo ./G_21_run_native.sh --gpus 2 --epochs 10 --duration 180
+## Requirements
 
-# Container profiling only
-sudo ./G_21_run_container.sh --gpus 2 --epochs 10 --duration 180
-
-# Build Docker image
-./G_21_container_setup.sh build
-```
-
-### Run Individual Profilers
-
-> **Note**: eBPF profilers (CPU, syscall, network) require system Python with PYTHONPATH for BCC.
-> The GPU monitor uses the venv Python.
-
-```bash
-# eBPF CPU profiler (must use system python3 + PYTHONPATH)
-sudo env PYTHONPATH=/usr/lib/python3/dist-packages python3 G_21_cpu_profiler.py --duration 60 --output cpu_results.csv
-
-# eBPF Syscall counter
-sudo env PYTHONPATH=/usr/lib/python3/dist-packages python3 G_21_syscall_counter.py --duration 60 --output syscall_results.csv
-
-# eBPF Network profiler
-sudo env PYTHONPATH=/usr/lib/python3/dist-packages python3 G_21_net_profiler.py --duration 60 --output net_results.csv
-
-# GPU monitor (nvidia-smi, uses venv Python)
-venv/bin/python3 G_21_gpu_monitor_nvidia.py --duration 60 --interval 0.1 --output gpu_results.csv
-
-# eGPU monitor (eBPF uprobes on libcuda.so)
-sudo env PYTHONPATH=/usr/lib/python3/dist-packages python3 G_21_egpu_monitor.py
-```
-
-### Generate Plots
-
-```bash
-# Hardcoded plots (no CSV input required)
-python3 G_21_plot_hardcoded.py
-
-# Comparison plots from CSVs
-python3 G_21_compare_results.py
-
-# CPU analysis
-python3 G_21_analyze_cpu.py --compare results/native results/container
-```
-
-### Federated Learning (Partner Component — Sanskar-Kunal/)
-
-```bash
-# Local dry run with eBPF monitoring
-sudo ./Sanskar-Kunal/G_21_local_dry_run.sh
-
-# Or manually:
-# Terminal 1: Start FL server
-python3 Sanskar-Kunal/G_21_federated_server.py
-
-# Terminal 2: Start FL client
-python3 Sanskar-Kunal/G_21_federated_client.py
-
-# Terminal 3: Start eGPU monitor
-sudo env PYTHONPATH=/usr/lib/python3/dist-packages python3 G_21_egpu_monitor.py
-
-# Terminal 4: Start network monitor
-sudo env PYTHONPATH=/usr/lib/python3/dist-packages python3 Sanskar-Kunal/G_21_egpu_net_monitor.py
-```
-
-## eBPF Profiling Details
-
-### CPU Profiler (`G_21_cpu_profiler.py`)
-- **Technique**: Attaches to `sched:sched_switch` tracepoint
-- **Metrics**: Context switch count per process, scheduling latency (time on run queue)
-- **Output**: Two CSVs — `ctx_switches.csv` and `sched_latency.csv`
-
-### Syscall Counter (`G_21_syscall_counter.py`)
-- **Technique**: Attaches to `raw_syscalls:sys_enter` and `raw_syscalls:sys_exit` tracepoints
-- **Metrics**: Per-syscall count, total/avg/min/max latency
-- **Output**: CSV with syscall number, name, count, latency statistics
-
-### Network Profiler (`G_21_net_profiler.py`)
-- **Technique**: kprobes on `tcp_sendmsg` and `tcp_recvmsg`
-- **Metrics**: TCP send/recv latency per packet, byte counts, process info
-- **Output**: CSV with timestamp, PID, comm, event_type, latency_ns, bytes
-
-### eGPU Monitor (`G_21_egpu_monitor.py`) — Hybrid Approach
-- **Technique**: eBPF uprobes on `libcuda.so` functions (`cuLaunchKernel`, `cuMemcpyHtoD_v2`, `cuMemcpyDtoH_v2`)
-- **Metrics**: GPU kernel launch events (COMPUTE_MATH) and memory transfer events (MEM_TRANSFER)
-- **Output**: CSV trace with timestamp, event type, duration
-- **Reference**: Inspired by eGPU (Yang et al., "eGPU: Extending eBPF Programmability to GPUs," HCDS '25)
-- **Limitation**: Traces CUDA driver API calls from CPU side via uprobes (not PTX-level GPU kernel instrumentation). The full eGPU framework requires LLVM ≥15 and custom bpftime runtime which could not be built in our environment.
-
-## Methodology
-
-1. **Start eBPF profilers** on host (CPU, syscall, network, eGPU)
-2. **Start GPU monitor** (nvidia-smi polling at 100ms intervals)
-3. **Run ML workload** (ResNet-18 DDP training):
-   - **Native**: Direct execution on bare metal
-   - **Container**: Docker with `--gpus all`, namespace isolation, cgroups
-4. **Collect results** in timestamped CSV/JSON format
-5. **Compare metrics** between native and containerized runs
-6. **Generate visualizations** with hardcoded matplotlib plots
-
-## Hardcoded Plots (G_21_plot_hardcoded.py)
-
-All 11 plots generated with hardcoded values from experiment results:
-
-1. **Training Loss** — Loss curve: Native vs Container
-2. **Training Accuracy** — Train/test accuracy per epoch
-3. **Throughput** — Samples/sec per epoch (bar chart)
-4. **Epoch Time** — Per-epoch training time
-5. **Total Comparison** — Training time, throughput, GPU util, power
-6. **GPU Metrics** — Utilization, power, temperature over time
-7. **Syscall Comparison** — Top 10 syscalls by count
-8. **Syscall Latency** — Average latency per syscall type
-9. **Network Comparison** — TCP send/recv latency and counts
-10. **Scheduler Latency** — Mean/P95/P99 + context switches
-11. **Overhead Summary Table** — All metrics in a single table
-
-## Limitations
-
-1. **eGPU Build**: The real eGPU framework (PTX-level GPU instrumentation) could not be built due to LLVM version constraints (requires ≥15, host has 14, Docker image has 10). We use a hybrid eBPF uprobe approach instead.
-2. **eBPF Root Access**: All eBPF profilers require root/sudo privileges, limiting deployment in locked-down environments.
-3. **Kernel Version**: BCC 0.18 on kernel 5.15 — some newer eBPF features (e.g., BPF LSM, ringbuf) are not available.
-4. **Single-Node Only**: Experiments run on one server with 2 GPUs. Multi-node distributed training overhead is not captured.
-5. **nvidia-smi Polling**: GPU metrics are sampled at 100ms intervals — sub-millisecond GPU events may be missed.
-
-## References
-
-- Yang et al., "eGPU: Extending eBPF Programmability and Observability to GPUs," HCDS '25
-- BCC (BPF Compiler Collection): https://github.com/iovisor/bcc
-- PyTorch DDP: https://pytorch.org/tutorials/intermediate/ddp_tutorial.html
-- NVIDIA Container Toolkit: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/
-
-## Repository
-
-- GitHub: https://github.com/dewansh3255/21_ebpf_egpu
-- Partner: https://github.com/Sanskargoyal608/eBPF-eGPU
+PyTorch + torchvision (CUDA 12.1), `nvidia-ml-py`, numpy, matplotlib, FastAPI +
+uvicorn + `python-multipart` (server), requests, tqdm. See `requirements.txt`.
+BCC and kernel headers come from the distro (see Setup).
