@@ -15,6 +15,7 @@ nvidia-ml-py        # provides the `pynvml` module used by nvml_monitor.py
 # ---- Federated learning server/client ----
 fastapi
 uvicorn
+python-multipart
 requests
 tqdm
 

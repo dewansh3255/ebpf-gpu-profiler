@@ -29,7 +29,7 @@ done
 # deps into the user site with pip --user instead of a virtualenv.
 PY="${PY:-python3}"
 echo "[*] Ensuring server deps (fastapi/uvicorn/requests/tqdm) in user site..."
-"${PY}" -m pip install --user --quiet fastapi uvicorn requests tqdm || true
+"${PY}" -m pip install --user --quiet fastapi uvicorn python-multipart requests tqdm || true
 
 echo "============================================================"
 echo "  PHASE 2 FL SERVER | arch=${ARCH} clients=${CLIENTS} port=${PORT}"
