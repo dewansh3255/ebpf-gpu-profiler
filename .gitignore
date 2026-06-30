@@ -16,11 +16,13 @@ data/
 *.pt
 cifar-10-batches-py/
 
-# ---- Raw telemetry traces (regenerated per run) ----
+# ---- Raw telemetry traces (regenerated per run; kept local, too big for git) ----
 *.csv
 gpu_trace_*.csv
 network_trace_*.csv
 perfetto_*.json
+client_log.txt
+*_log.txt
 
 # ---- Large/binary artifacts ----
 *.pdf
